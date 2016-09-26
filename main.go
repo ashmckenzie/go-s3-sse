@@ -5,6 +5,7 @@ import (
   "log"
   "os"
   "runtime/debug"
+  "strconv"
 
   pb "gopkg.in/cheggaaa/pb.v1"
 
@@ -64,7 +65,12 @@ func objectsFor(s3Client *s3.S3, bucketName string) []*s3Object {
 
   objects = objectsForReal(s3Client, objects, bucketName, continuationToken, startAfter)
 
-  logIt("objectsFor(): Getting metadata for objects..")
+  if len(objects) == 0 {
+    logIt("objectsFor(): No objects!")
+    return objects
+  }
+
+  logIt("objectsFor(): Getting metadata for " + strconv.Itoa(len(objects)) + " objects..")
 
   bar := pb.StartNew(len(objects))
   bar.Output = os.Stderr
@@ -115,6 +121,10 @@ func objectsForReal(s3Client *s3.S3, objects []*s3Object, bucketName string, con
   if *resp.IsTruncated {
     continuationToken = *resp.NextContinuationToken
     startAfter = objects[len(objects)-1].Key
+
+    if (len(objects) % 10000) == 0 {
+      logIt("objectsForReal(): Found " + strconv.Itoa(len(objects)) + " objects..")
+    }
 
     objects = objectsForReal(s3Client, objects, bucketName, continuationToken, startAfter)
   }
@@ -168,11 +178,10 @@ func validateParams(bucketName string, roleName string) error {
   return nil
 }
 
-func setupLogging(bucketName string) {
+func setupLogging(logFileName string) {
   logger = log.New(os.Stdout, "", log.Ldate|log.Lmicroseconds)
 
-  logFile := fmt.Sprintf("%s.log", bucketName)
-  f, err := os.OpenFile(logFile, os.O_RDWR|os.O_CREATE, 0600)
+  f, err := os.OpenFile(logFileName, os.O_RDWR|os.O_CREATE, 0600)
   if err != nil {
     errorPrint("setupLogging(): " + err.Error())
   }
@@ -184,6 +193,7 @@ func main() {
   var credentialsFileName string
   var bucketName string
   var roleName string
+  var logFileName string
 
   app := cli.NewApp()
   app.Name = "s3-sse"
@@ -209,6 +219,12 @@ func main() {
       EnvVar:      "ROLE_NAME",
       Destination: &roleName,
     },
+    cli.StringFlag{
+      Name:        "log-file-name, l",
+      Usage:       "Log file name",
+      EnvVar:      "LOG_FILE_NAME",
+      Destination: &logFileName,
+    },
     cli.BoolFlag{
       Name:        "debug",
       Usage:       "Debug mode",
@@ -230,7 +246,11 @@ func main() {
           return err
         }
 
-        setupLogging(bucketName)
+        if len(logFileName) == 0 {
+          logFileName = fmt.Sprintf("%s.log", bucketName)
+        }
+
+        setupLogging(logFileName)
         reportForBucket(s3Client(credentialsFileName, roleName), bucketName)
         return nil
       },
@@ -245,7 +265,11 @@ func main() {
           return err
         }
 
-        setupLogging(bucketName)
+        if len(logFileName) == 0 {
+          logFileName = fmt.Sprintf("%s.log", bucketName)
+        }
+
+        setupLogging(logFileName)
         encryptBucket(s3Client(credentialsFileName, roleName), bucketName)
         return nil
       },
