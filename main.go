@@ -198,7 +198,7 @@ func main() {
   app := cli.NewApp()
   app.Name = "s3-sse"
   app.Usage = "S3 SSE tool"
-  app.Version = "0.1.0"
+  app.Version = os.Getenv("VERSION")
 
   app.Flags = []cli.Flag{
     cli.StringFlag{
