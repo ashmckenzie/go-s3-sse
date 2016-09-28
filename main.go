@@ -4,13 +4,17 @@ import (
   "fmt"
   "log"
   "os"
+  "runtime"
   "runtime/debug"
   "strconv"
+  "time"
 
   pb "gopkg.in/cheggaaa/pb.v1"
 
+  _ "github.com/mattn/go-sqlite3"
+
+  "github.com/Bowbaq/profilecreds"
   "github.com/aws/aws-sdk-go/aws"
-  "github.com/aws/aws-sdk-go/aws/credentials"
   "github.com/aws/aws-sdk-go/aws/session"
   "github.com/aws/aws-sdk-go/service/s3"
   "github.com/urfave/cli"
@@ -19,9 +23,16 @@ import (
 // DEBUG ...
 var DEBUG = false
 
+// VERBOSE ...
+var VERBOSE = false
+
 var logger *log.Logger
+var errorLogger *log.Logger
 var diskLogger *log.Logger
 var f os.File
+
+var s3Client *s3.S3
+var workerCount int
 
 type s3Object struct {
   Bucket     string
@@ -29,77 +40,130 @@ type s3Object struct {
   Encryption string
 }
 
+func debugIt(message string) {
+  if DEBUG {
+    logIt("DEBUG: " + message)
+  }
+}
+
 func logIt(message string) {
   if logger != nil && diskLogger != nil {
-    logger.Println(message)
+    if VERBOSE {
+      logger.Println(message)
+    }
     diskLogger.Println(message)
   } else {
     log.Println(message)
   }
 }
 
-func errorPrint(err string) {
-  logIt(err)
+func errorPrint(message string) {
+  errorLogger.Println("ERROR: " + message)
   if DEBUG {
     panic(debug.Stack())
   }
 }
 
-func s3Client(credentialsFileName string, roleName string) *s3.S3 {
-  creds := credentials.NewSharedCredentials(credentialsFileName, roleName)
+func getS3Client(awsRegionName string, credentialsFileName string, roleName string) *s3.S3 {
+  profilecreds.DefaultDuration = 1 * time.Hour
+
+  creds := profilecreds.NewCredentials("virginia-admin", func(p *profilecreds.AssumeRoleProfileProvider) {
+    p.Cache = profilecreds.NewFileCache("")
+  })
 
   config := aws.Config{
-    Credentials: creds,
-    Region:      aws.String("us-east-1"),
+    Credentials:      creds,
+    S3ForcePathStyle: aws.Bool(false),
+    Region:           aws.String(awsRegionName),
   }
 
   return s3.New(session.New(), &config)
 }
 
-func objectsFor(s3Client *s3.S3, bucketName string) []*s3Object {
+func objectsFor(bucketName string) []*s3Object {
   continuationToken := ""
   startAfter := ""
+
   var objects []*s3Object
+
+  // db, err := sql.Open("sqlite3", "./foo.db")
+  // if err != nil {
+  //   log.Fatal(err)
+  // }
+  // defer db.Close()
+  //
+  // sqlStmt := `
+  // create table objects (id integer not null primary key, bucket text, key text, encryption text);
+  // `
+  // _, err = db.Exec(sqlStmt)
+  // if err != nil {
+  //   log.Printf("%q: %s\n", err, sqlStmt)
+  // }
+  // INSERT OR REPLACE INTO Employee ("id", "name", "role") VALUES (1, "John Foo", "CEO")
 
   logIt("objectsFor(): Getting list of objects..")
 
-  objects = objectsForReal(s3Client, objects, bucketName, continuationToken, startAfter)
+  objects = examineObjects(objects, bucketName, continuationToken, startAfter)
+  objectCount := len(objects)
 
-  if len(objects) == 0 {
+  if objectCount == 0 {
     logIt("objectsFor(): No objects!")
     return objects
   }
 
-  logIt("objectsFor(): Getting metadata for " + strconv.Itoa(len(objects)) + " objects..")
+  logIt("objectsFor(): Getting metadata for " + strconv.Itoa(objectCount) + " objects..")
 
-  bar := pb.StartNew(len(objects))
+  jobs := make(chan *s3Object, objectCount)
+  results := make(chan bool, objectCount)
+
+  logIt("objectsFor(): Starting up " + strconv.Itoa(workerCount) + " workers..")
+
+  bar := pb.StartNew(objectCount)
   bar.Output = os.Stderr
 
-  for _, object := range objects {
-    bar.Increment()
+  for i := 1; i <= workerCount; i++ {
+    go worker(jobs, results)
+  }
 
+  for i := 0; i < objectCount; i++ {
+    object := objects[i]
+    jobs <- object
+  }
+  close(jobs)
+
+  for i := 0; i < objectCount; i++ {
+    <-results
+    bar.Increment()
+  }
+  close(results)
+
+  bar.Finish()
+
+  return objects
+}
+
+func worker(jobs <-chan *s3Object, results chan<- bool) {
+  for object := range jobs {
     params := &s3.HeadObjectInput{
-      Bucket: aws.String(bucketName),
+      Bucket: aws.String(object.Bucket),
       Key:    aws.String(object.Key),
     }
 
     head, err := s3Client.HeadObject(params)
     if err != nil {
       errorPrint("objectsFor(): s3Client.HeadObject(params) " + err.Error())
+      log.Fatal(err)
+    } else {
+      if head.ServerSideEncryption != nil {
+        object.Encryption = *head.ServerSideEncryption
+      }
     }
 
-    encryption := "NONE"
-    if head.ServerSideEncryption != nil {
-      encryption = *head.ServerSideEncryption
-    }
-
-    object.Encryption = encryption
+    results <- true
   }
-
-  return objects
 }
 
-func objectsForReal(s3Client *s3.S3, objects []*s3Object, bucketName string, continuationToken string, startAfter string) []*s3Object {
+func examineObjects(objects []*s3Object, bucketName string, continuationToken string, startAfter string) []*s3Object {
   listObjectsParams := &s3.ListObjectsV2Input{
     Bucket: aws.String(bucketName),
   }
@@ -110,6 +174,7 @@ func objectsForReal(s3Client *s3.S3, objects []*s3Object, bucketName string, con
   }
 
   resp, err := s3Client.ListObjectsV2(listObjectsParams)
+
   if err != nil {
     errorPrint("objectsFor(): s3Client.ListObjectsV2(listObjectsParams) " + err.Error())
   }
@@ -123,35 +188,31 @@ func objectsForReal(s3Client *s3.S3, objects []*s3Object, bucketName string, con
     startAfter = objects[len(objects)-1].Key
 
     if (len(objects) % 10000) == 0 {
-      logIt("objectsForReal(): Found " + strconv.Itoa(len(objects)) + " objects..")
+      logIt("examineObjects(): Found " + strconv.Itoa(len(objects)) + " objects..")
     }
 
-    objects = objectsForReal(s3Client, objects, bucketName, continuationToken, startAfter)
+    debugIt("examineObjects(): continuationToken:" + continuationToken + ", startAfter:" + startAfter)
+
+    objects = examineObjects(objects, bucketName, continuationToken, startAfter)
   }
 
   return objects
 }
 
-func reportForBucket(s3Client *s3.S3, bucketName string) {
-  objects := objectsFor(s3Client, bucketName)
+func processBucket(bucketName string, encrypt bool) {
+  objects := objectsFor(bucketName)
 
   for _, object := range objects {
-    logIt(object.Key + " encryption:" + object.Encryption)
-  }
-}
-
-func encryptBucket(s3Client *s3.S3, bucketName string) {
-  objects := objectsFor(s3Client, bucketName)
-
-  for _, object := range objects {
-    if object.Encryption != "AES256" {
-      logIt(object.Key + " encryption: (WILL ENCRYPT)" + object.Encryption)
-      encryptObject(s3Client, object)
+    if encrypt == true && object.Encryption != "AES256" {
+      logIt(object.Key + " encryption:" + object.Encryption + " -> AES256")
+      encryptObject(object)
+    } else {
+      logIt(object.Key + " encryption:" + object.Encryption)
     }
   }
 }
 
-func encryptObject(s3Client *s3.S3, object *s3Object) {
+func encryptObject(object *s3Object) {
   copySource := fmt.Sprintf("%s/%s", object.Bucket, object.Key)
 
   params := &s3.CopyObjectInput{
@@ -178,10 +239,11 @@ func validateParams(bucketName string, roleName string) error {
   return nil
 }
 
-func setupLogging(logFileName string) {
+func setupLogging(logFileName string, extra string) {
   logger = log.New(os.Stdout, "", log.Ldate|log.Lmicroseconds)
+  errorLogger = log.New(os.Stderr, "", log.Ldate|log.Lmicroseconds)
 
-  f, err := os.OpenFile(logFileName, os.O_RDWR|os.O_CREATE, 0600)
+  f, err := os.OpenFile(extra+"_"+logFileName, os.O_RDWR|os.O_CREATE, 0600)
   if err != nil {
     errorPrint("setupLogging(): " + err.Error())
   }
@@ -190,17 +252,28 @@ func setupLogging(logFileName string) {
 }
 
 func main() {
+  var awsRegionName string
   var credentialsFileName string
   var bucketName string
   var roleName string
   var logFileName string
 
+  numCPUs := runtime.NumCPU()
+  runtime.GOMAXPROCS(numCPUs)
+
   app := cli.NewApp()
+
   app.Name = "s3-sse"
   app.Usage = "S3 SSE tool"
   app.Version = os.Getenv("VERSION")
 
   app.Flags = []cli.Flag{
+    cli.StringFlag{
+      Name:        "aws-region",
+      Usage:       "AWS region",
+      EnvVar:      "AWS_REGION",
+      Destination: &awsRegionName,
+    },
     cli.StringFlag{
       Name:        "credentials, c",
       Usage:       "AWS credentials location",
@@ -224,6 +297,19 @@ func main() {
       Usage:       "Log file name",
       EnvVar:      "LOG_FILE_NAME",
       Destination: &logFileName,
+    },
+    cli.IntFlag{
+      Name:        "workers, 1",
+      Usage:       "Worker count (default is number of CPU's)",
+      EnvVar:      "WORKER_COUNT",
+      Value:       runtime.NumCPU(),
+      Destination: &workerCount,
+    },
+    cli.BoolFlag{
+      Name:        "verbose",
+      Usage:       "Verbose mode",
+      EnvVar:      "VERBOSE",
+      Destination: &VERBOSE,
     },
     cli.BoolFlag{
       Name:        "debug",
@@ -250,8 +336,9 @@ func main() {
           logFileName = fmt.Sprintf("%s.log", bucketName)
         }
 
-        setupLogging(logFileName)
-        reportForBucket(s3Client(credentialsFileName, roleName), bucketName)
+        setupLogging(logFileName, "report")
+        s3Client = getS3Client(awsRegionName, credentialsFileName, roleName)
+        processBucket(bucketName, false)
         return nil
       },
     },
@@ -269,8 +356,9 @@ func main() {
           logFileName = fmt.Sprintf("%s.log", bucketName)
         }
 
-        setupLogging(logFileName)
-        encryptBucket(s3Client(credentialsFileName, roleName), bucketName)
+        setupLogging(logFileName, "encrypt")
+        s3Client = getS3Client(awsRegionName, credentialsFileName, roleName)
+        processBucket(bucketName, true)
         return nil
       },
     },
