@@ -122,12 +122,11 @@ func objectsFor(bucketName string) []*s3Object {
   bar.Output = os.Stderr
 
   for i := 1; i <= workerCount; i++ {
-    go worker(jobs, results)
+    go getMetadataWorker(jobs, results)
   }
 
   for i := 0; i < objectCount; i++ {
-    object := objects[i]
-    jobs <- object
+    jobs <- objects[i]
   }
   close(jobs)
 
@@ -142,7 +141,7 @@ func objectsFor(bucketName string) []*s3Object {
   return objects
 }
 
-func worker(jobs <-chan *s3Object, results chan<- bool) {
+func getMetadataWorker(jobs <-chan *s3Object, results chan<- bool) {
   for object := range jobs {
     params := &s3.HeadObjectInput{
       Bucket: aws.String(object.Bucket),
@@ -163,6 +162,12 @@ func worker(jobs <-chan *s3Object, results chan<- bool) {
   }
 }
 
+func examineObjectWorker(bucketName string, jobs <-chan *s3.Object, results chan<- *s3Object) {
+  for object := range jobs {
+    results <- &s3Object{Bucket: bucketName, Key: *object.Key, Encryption: "????"}
+  }
+}
+
 func examineObjects(objects []*s3Object, bucketName string, continuationToken string, startAfter string) []*s3Object {
   listObjectsParams := &s3.ListObjectsV2Input{
     Bucket: aws.String(bucketName),
@@ -179,9 +184,23 @@ func examineObjects(objects []*s3Object, bucketName string, continuationToken st
     errorPrint("objectsFor(): s3Client.ListObjectsV2(listObjectsParams) " + err.Error())
   }
 
-  for _, tmpObject := range resp.Contents {
-    objects = append(objects, &s3Object{Bucket: bucketName, Key: *tmpObject.Key, Encryption: "????"})
+  jobCount := 0
+  jobs := make(chan *s3.Object, 1000)
+  results := make(chan *s3Object, 1000)
+
+  for i := 1; i <= workerCount; i++ {
+    go examineObjectWorker(bucketName, jobs, results)
   }
+
+  for _, tmpObject := range resp.Contents {
+    jobs <- tmpObject
+    jobCount++
+  }
+
+  for i := 0; i < jobCount; i++ {
+    objects = append(objects, <-results)
+  }
+  close(results)
 
   if *resp.IsTruncated {
     continuationToken = *resp.NextContinuationToken
@@ -242,6 +261,7 @@ func validateParams(bucketName string, roleName string) error {
 func setupLogging(logFileName string, extra string) {
   logger = log.New(os.Stdout, "", log.Ldate|log.Lmicroseconds)
   errorLogger = log.New(os.Stderr, "", log.Ldate|log.Lmicroseconds)
+  extra = fmt.Sprintf("%s_%s", time.Now().Format("20060102_150405"), extra)
 
   f, err := os.OpenFile(extra+"_"+logFileName, os.O_RDWR|os.O_CREATE, 0600)
   if err != nil {
@@ -300,9 +320,9 @@ func main() {
     },
     cli.IntFlag{
       Name:        "workers, 1",
-      Usage:       "Worker count (default is number of CPU's)",
+      Usage:       "Worker count (default is number of CPU's x 16)",
       EnvVar:      "WORKER_COUNT",
-      Value:       runtime.NumCPU(),
+      Value:       runtime.NumCPU() * 16,
       Destination: &workerCount,
     },
     cli.BoolFlag{
