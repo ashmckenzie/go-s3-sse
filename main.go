@@ -2,16 +2,14 @@ package main
 
 import (
   "fmt"
-  "log"
   "os"
   "runtime"
-  "runtime/debug"
   "strconv"
   "time"
 
-  pb "gopkg.in/cheggaaa/pb.v1"
-
+  "github.com/Sirupsen/logrus"
   _ "github.com/mattn/go-sqlite3"
+  pb "gopkg.in/cheggaaa/pb.v1"
 
   "github.com/Bowbaq/profilecreds"
   "github.com/aws/aws-sdk-go/aws"
@@ -26,10 +24,13 @@ var DEBUG = false
 // VERBOSE ...
 var VERBOSE = false
 
-var logger *log.Logger
-var errorLogger *log.Logger
-var diskLogger *log.Logger
-var f os.File
+var diskLoggerFile os.File
+
+// Logger ...
+var Logger *logrus.Logger
+
+// DiskLogger ...
+var DiskLogger *logrus.Logger
 
 var s3Client *s3.S3
 var workerCount int
@@ -38,30 +39,6 @@ type s3Object struct {
   Bucket     string
   Key        string
   Encryption string
-}
-
-func debugIt(message string) {
-  if DEBUG {
-    logIt("DEBUG: " + message)
-  }
-}
-
-func logIt(message string) {
-  if logger != nil && diskLogger != nil {
-    if VERBOSE {
-      logger.Println(message)
-    }
-    diskLogger.Println(message)
-  } else {
-    log.Println(message)
-  }
-}
-
-func errorPrint(message string) {
-  errorLogger.Println("ERROR: " + message)
-  if DEBUG {
-    panic(debug.Stack())
-  }
 }
 
 func getS3Client(awsRegionName string, credentialsFileName string, roleName string) *s3.S3 {
@@ -101,22 +78,22 @@ func objectsFor(bucketName string) []*s3Object {
   // }
   // INSERT OR REPLACE INTO Employee ("id", "name", "role") VALUES (1, "John Foo", "CEO")
 
-  logIt("objectsFor(): Getting list of objects..")
+  Logger.Info("Getting list of objects..")
 
   objects = examineObjects(objects, bucketName, continuationToken, startAfter)
   objectCount := len(objects)
 
   if objectCount == 0 {
-    logIt("objectsFor(): No objects!")
+    Logger.Info("No objects!")
     return objects
   }
 
-  logIt("objectsFor(): Getting metadata for " + strconv.Itoa(objectCount) + " objects..")
+  Logger.Info("Getting metadata for " + strconv.Itoa(objectCount) + " objects..")
 
   jobs := make(chan *s3Object, objectCount)
   results := make(chan bool, objectCount)
 
-  logIt("objectsFor(): Starting up " + strconv.Itoa(workerCount) + " workers..")
+  Logger.Info("Running with " + strconv.Itoa(workerCount) + " workers..")
 
   bar := pb.StartNew(objectCount)
   bar.Output = os.Stderr
@@ -150,8 +127,7 @@ func getMetadataWorker(jobs <-chan *s3Object, results chan<- bool) {
 
     head, err := s3Client.HeadObject(params)
     if err != nil {
-      errorPrint("objectsFor(): s3Client.HeadObject(params) " + err.Error())
-      log.Fatal(err)
+      Logger.Error("objectsFor(): s3Client.HeadObject(params) " + err.Error())
     } else {
       if head.ServerSideEncryption != nil {
         object.Encryption = *head.ServerSideEncryption
@@ -181,7 +157,7 @@ func examineObjects(objects []*s3Object, bucketName string, continuationToken st
   resp, err := s3Client.ListObjectsV2(listObjectsParams)
 
   if err != nil {
-    errorPrint("objectsFor(): s3Client.ListObjectsV2(listObjectsParams) " + err.Error())
+    Logger.Error("objectsFor(): s3Client.ListObjectsV2(listObjectsParams) " + err.Error())
   }
 
   jobCount := 0
@@ -207,10 +183,10 @@ func examineObjects(objects []*s3Object, bucketName string, continuationToken st
     startAfter = objects[len(objects)-1].Key
 
     if (len(objects) % 10000) == 0 {
-      logIt("examineObjects(): Found " + strconv.Itoa(len(objects)) + " objects..")
+      Logger.Info("Found " + strconv.Itoa(len(objects)) + " objects..")
     }
 
-    debugIt("examineObjects(): continuationToken:" + continuationToken + ", startAfter:" + startAfter)
+    Logger.Debug("examineObjects(): continuationToken:" + continuationToken + ", startAfter:" + startAfter)
 
     objects = examineObjects(objects, bucketName, continuationToken, startAfter)
   }
@@ -244,7 +220,7 @@ func encryptObject(object *s3Object) {
   _, err := s3Client.CopyObject(params)
 
   if err != nil {
-    errorPrint("encryptObject(): s3Client.CopyObject(params) " + err.Error())
+    Logger.Error("encryptObject(): s3Client.CopyObject(params) " + err.Error())
   }
 }
 
@@ -259,16 +235,24 @@ func validateParams(bucketName string, roleName string) error {
 }
 
 func setupLogging(logFileName string, extra string) {
-  logger = log.New(os.Stdout, "", log.Ldate|log.Lmicroseconds)
-  errorLogger = log.New(os.Stderr, "", log.Ldate|log.Lmicroseconds)
-  extra = fmt.Sprintf("%s_%s", time.Now().Format("20060102_150405"), extra)
+  txtFormatter := &logrus.TextFormatter{DisableColors: true}
+  fullFileName := fmt.Sprintf("%s_%s_%s", time.Now().Format("20060102_150405"), extra, logFileName)
 
-  f, err := os.OpenFile(extra+"_"+logFileName, os.O_RDWR|os.O_CREATE, 0600)
-  if err != nil {
-    errorPrint("setupLogging(): " + err.Error())
+  f, _ := os.OpenFile(fullFileName, os.O_RDWR|os.O_CREATE, 0600)
+
+  Logger = logrus.New()
+  DiskLogger = logrus.New()
+
+  DiskLogger.Formatter = txtFormatter
+  DiskLogger.Out = f
+
+  if DEBUG {
+    Logger.Level = logrus.DebugLevel
+    DiskLogger.Level = logrus.DebugLevel
+  } else if VERBOSE {
+    Logger.Level = logrus.InfoLevel
+    DiskLogger.Level = logrus.InfoLevel
   }
-
-  diskLogger = log.New(f, "", log.Ldate|log.Lmicroseconds)
 }
 
 func main() {
@@ -338,8 +322,6 @@ func main() {
       Destination: &DEBUG,
     },
   }
-
-  defer f.Close()
 
   app.Commands = []cli.Command{
     {
