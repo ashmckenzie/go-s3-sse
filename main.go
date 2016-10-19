@@ -237,6 +237,10 @@ func reportOnBucket(bucketName string) {
   go func() {
     count := 0
     for object := range getObjectsForBucketResults {
+      wg.Done()
+      if object == nil {
+        continue
+      }
       count++
       if (count % 5000) == 0 {
         Logger.Info("Found " + strconv.Itoa(count) + " objects so far..")
@@ -246,7 +250,6 @@ func reportOnBucket(bucketName string) {
         "updated":    object.LastModified,
         "size":       object.Size,
       }).Info(object.Key)
-      wg.Done()
     }
     Logger.Info("Found " + strconv.Itoa(count) + " objects total")
   }()
@@ -284,6 +287,10 @@ func encryptObjectsInBucket(bucketName string) {
   go func() {
     count := 0
     for object := range getObjectsForBucketResults {
+      wg.Done()
+      if object == nil {
+        continue
+      }
       count++
       if (count % 5000) == 0 {
         Logger.Info("Found " + strconv.Itoa(count) + " objects so far..")
@@ -293,7 +300,6 @@ func encryptObjectsInBucket(bucketName string) {
       } else {
         encryptObjectWorkerJobs <- object
       }
-      wg.Done()
     }
     Logger.Info("Found " + strconv.Itoa(count) + " objects total")
   }()
@@ -301,12 +307,15 @@ func encryptObjectsInBucket(bucketName string) {
   go func() {
     count := 0
     for object := range encryptObjectWorkerResults {
+      wg.Done()
+      if object == nil {
+        continue
+      }
       count++
       if (count % 5000) == 0 {
         Logger.Info("Encrypted " + strconv.Itoa(count) + " objects so far..")
       }
       logObjectToDisk(object, true)
-      wg.Done()
     }
     Logger.Info("Encrypted " + strconv.Itoa(count) + " objects total")
   }()
