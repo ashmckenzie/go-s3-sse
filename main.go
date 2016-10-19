@@ -11,8 +11,10 @@ import (
 
   "net/http"
   _ "net/http/pprof"
+  "net/url"
 
   "github.com/Bowbaq/profilecreds"
+  "github.com/davecgh/go-spew/spew"
 
   "github.com/Sirupsen/logrus"
 
@@ -44,9 +46,11 @@ var wg sync.WaitGroup
 const neededEncryptionType string = "AES256"
 
 type s3Object struct {
-  Bucket     string
-  Key        string
-  Encryption string
+  Bucket       string
+  Key          string
+  Encryption   string
+  Size         int64
+  LastModified time.Time
 }
 
 func setupS3Client(awsRegionName string, credentialsFileName string, roleName string) {
@@ -68,59 +72,115 @@ func setupS3Client(awsRegionName string, credentialsFileName string, roleName st
 
 func getMetadataWorker(num int, jobs <-chan *s3Object, results chan<- *s3Object) {
   for object := range jobs {
-    DiskLogger.Debug(fmt.Sprintf("getMetadataWorker(): num=[%d], object=[%v] - calling getMetaDataForObject()", num, object))
+    DiskLogger.WithFields(logrus.Fields{
+      "function": "getMetadataWorker",
+      "num":      num,
+      "object":   object,
+    }).Debug("calling getMetaDataForObject()")
+
     wg.Add(1)
-    go getMetaDataForObject(object, results)
+    go func() {
+      results <- getMetaDataForObject(object)
+    }()
   }
 }
 
 func encryptObjectWorker(num int, jobs <-chan *s3Object, results chan<- *s3Object) {
   for object := range jobs {
-    DiskLogger.Debug(fmt.Sprintf("encryptObjectWorker(): num=[%d], object=[%v] - calling encryptObject()", num, object))
+    DiskLogger.WithFields(logrus.Fields{
+      "function": "encryptObjectWorker",
+      "num":      num,
+      "object":   object,
+    }).Debug("calling encryptObject()")
+
     wg.Add(1)
-    go encryptObject(object, results)
+    go func() {
+      results <- encryptObject(object)
+    }()
   }
 }
 
-func encryptObject(object *s3Object, results chan<- *s3Object) {
+func encryptObjectInBucket(bucketName string, key string) {
+  object := getObjectForBucket(bucketName, key)
+  spew.Dump(object)
+  if object.Encryption != neededEncryptionType {
+    spew.Dump(encryptObject(object))
+  }
+}
+
+func encryptObject(object *s3Object) *s3Object {
   copySource := fmt.Sprintf("%s/%s", object.Bucket, object.Key)
 
   params := &s3.CopyObjectInput{
     Bucket:               aws.String(object.Bucket),
     Key:                  aws.String(object.Key),
-    CopySource:           aws.String(copySource),
+    CopySource:           aws.String(url.QueryEscape(copySource)),
     ServerSideEncryption: aws.String(neededEncryptionType),
   }
 
   _, err := s3Client.CopyObject(params)
 
   if err != nil {
-    Logger.Error("encryptObjectWorker(): s3Client.CopyObject(params) " + err.Error())
+    Logger.WithFields(logrus.Fields{
+      "function":        "encryptObject",
+      "called_function": "s3Client.CopyObject(params)",
+      "params":          params,
+      "object":          object,
+    }).Error(err.Error())
   } else {
-    object.Encryption = neededEncryptionType
+    return getObjectForBucket(object.Bucket, object.Key)
   }
 
-  results <- object
+  return nil
 }
 
-func getMetaDataForObject(object *s3Object, results chan<- *s3Object) {
+func getObjectForBucket(bucketName string, key string) *s3Object {
+  params := &s3.GetObjectInput{
+    Bucket: aws.String(bucketName),
+    Key:    aws.String(key),
+  }
+
+  tmpObject, err := s3Client.GetObject(params)
+  if err != nil {
+    Logger.WithFields(logrus.Fields{
+      "function":        "getObject",
+      "called_function": "s3Client.GetObject(params)",
+      "params":          params,
+      "bucketName":      bucketName,
+      "key":             key,
+    }).Error(err.Error())
+  } else {
+    object := &s3Object{Bucket: bucketName, Key: key, Encryption: "????", Size: *tmpObject.ContentLength, LastModified: *tmpObject.LastModified}
+    return getMetaDataForObject(object)
+  }
+
+  return nil
+}
+
+func getMetaDataForObject(object *s3Object) *s3Object {
   params := &s3.HeadObjectInput{
     Bucket: aws.String(object.Bucket),
     Key:    aws.String(object.Key),
   }
 
-  head, err := s3Client.HeadObject(params)
+  tmpObject, err := s3Client.HeadObject(params)
   if err != nil {
-    Logger.Error("getMetaDataForObject(): s3Client.HeadObject(params) " + err.Error())
+    Logger.WithFields(logrus.Fields{
+      "function":        "getMetaDataForObject",
+      "called_function": "s3Client.HeadObject(params)",
+      "params":          params,
+      "object":          object,
+    }).Error(err.Error())
   } else {
-    if head.ServerSideEncryption != nil {
-      object.Encryption = *head.ServerSideEncryption
+    if tmpObject.ServerSideEncryption != nil {
+      object.Encryption = *tmpObject.ServerSideEncryption
     } else {
-      object.Encryption = "UNKNOWN"
+      object.Encryption = "NONE"
     }
+    return object
   }
 
-  results <- object
+  return nil
 }
 
 func getObjectsForBucket(jobs chan<- *s3Object, results chan<- *s3Object, bucketName string, continuationToken string, startAfter string) {
@@ -136,16 +196,23 @@ func getObjectsForBucket(jobs chan<- *s3Object, results chan<- *s3Object, bucket
   resp, err := s3Client.ListObjectsV2(listObjectsParams)
 
   if err != nil {
-    Logger.Error("getObjectsForBucket(): s3Client.ListObjectsV2(listObjectsParams) " + err.Error())
+    Logger.WithFields(logrus.Fields{
+      "function":        "getObjectsForBucket",
+      "called_function": "s3Client.ListObjectsV2(listObjectsParams)",
+      "params":          listObjectsParams,
+    }).Error(err.Error())
+    return
   }
 
   jobCount := 0
 
   for _, tmpObject := range resp.Contents {
     jobCount++
-    object := &s3Object{Bucket: bucketName, Key: *tmpObject.Key, Encryption: "????"}
-    DiskLogger.Debug(fmt.Sprintf("getObjectsForBucket(): object=[%v]", object))
-    // wg.Add(1)
+    object := &s3Object{Bucket: bucketName, Key: *tmpObject.Key, Encryption: "????", Size: *tmpObject.Size, LastModified: *tmpObject.LastModified}
+    DiskLogger.WithFields(logrus.Fields{
+      "function": "getObjectsForBucket",
+      "object":   object,
+    }).Debug()
     jobs <- object
   }
 
@@ -155,6 +222,10 @@ func getObjectsForBucket(jobs chan<- *s3Object, results chan<- *s3Object, bucket
 
     getObjectsForBucket(jobs, results, bucketName, continuationToken, startAfter)
   }
+}
+
+func reportOnObjectInBucket(bucketName string, key string) {
+  spew.Dump(getObjectForBucket(bucketName, key))
 }
 
 func reportOnBucket(bucketName string) {
@@ -168,11 +239,16 @@ func reportOnBucket(bucketName string) {
     for object := range getObjectsForBucketResults {
       count++
       if (count % 5000) == 0 {
-        Logger.Info("Found " + strconv.Itoa(count) + " objects..")
+        Logger.Info("Found " + strconv.Itoa(count) + " objects so far..")
       }
-      DiskLogger.Info(string(object.Key) + " encryption:" + string(object.Encryption))
+      DiskLogger.WithFields(logrus.Fields{
+        "encryption": object.Encryption,
+        "updated":    object.LastModified,
+        "size":       object.Size,
+      }).Info(object.Key)
       wg.Done()
     }
+    Logger.Info("Found " + strconv.Itoa(count) + " objects total")
   }()
 
   for i := 1; i <= workerCount; i++ {
@@ -187,11 +263,20 @@ func reportOnBucket(bucketName string) {
   close(getObjectsForBucketResults)
 }
 
-func encryptBucket(bucketName string) {
+func logObjectToDisk(object *s3Object, changed bool) {
+  DiskLogger.WithFields(logrus.Fields{
+    "encryption": object.Encryption,
+    "updated":    object.LastModified,
+    "size":       object.Size,
+    "changed":    changed,
+  }).Info(object.Key)
+}
+
+func encryptObjectsInBucket(bucketName string) {
   Logger.Info("Getting list of objects..")
 
-  getObjectsForBucketJobs := make(chan *s3Object)
-  getObjectsForBucketResults := make(chan *s3Object)
+  getObjectsForBucketJobs := make(chan *s3Object, 1000)
+  getObjectsForBucketResults := make(chan *s3Object, 1000)
 
   encryptObjectWorkerJobs := make(chan *s3Object)
   encryptObjectWorkerResults := make(chan *s3Object)
@@ -201,15 +286,16 @@ func encryptBucket(bucketName string) {
     for object := range getObjectsForBucketResults {
       count++
       if (count % 5000) == 0 {
-        Logger.Info("Found " + strconv.Itoa(count) + " objects..")
+        Logger.Info("Found " + strconv.Itoa(count) + " objects so far..")
       }
       if object.Encryption == neededEncryptionType {
-        DiskLogger.Info(string(object.Key) + " encryption:" + string(object.Encryption) + " updated=false")
+        logObjectToDisk(object, false)
       } else {
         encryptObjectWorkerJobs <- object
       }
       wg.Done()
     }
+    Logger.Info("Found " + strconv.Itoa(count) + " objects total")
   }()
 
   go func() {
@@ -217,11 +303,12 @@ func encryptBucket(bucketName string) {
     for object := range encryptObjectWorkerResults {
       count++
       if (count % 5000) == 0 {
-        Logger.Info("Encrypted " + strconv.Itoa(count) + " objects..")
+        Logger.Info("Encrypted " + strconv.Itoa(count) + " objects so far..")
       }
-      DiskLogger.Info(string(object.Key) + " encryption:" + string(object.Encryption) + " updated=true")
+      logObjectToDisk(object, true)
       wg.Done()
     }
+    Logger.Info("Encrypted " + strconv.Itoa(count) + " objects total")
   }()
 
   for i := 1; i <= workerCount; i++ {
@@ -247,7 +334,7 @@ func validateParams(regionName string, bucketName string, roleName string) error
   }
 
   if len(bucketName) == 0 {
-    return cli.NewExitError("ERROR: AWS S3 bucket name is empty", 1)
+    return cli.NewExitError("ERROR: AWS S3 bucket name is empty", 2)
   }
 
   return nil
@@ -276,6 +363,14 @@ func setupLogging(logFileName string, extra string) {
   }
 }
 
+func setupProfiler() {
+  if DEBUG {
+    go func() {
+      log.Println(http.ListenAndServe("localhost:6060", nil))
+    }()
+  }
+}
+
 func setup(c *cli.Context, style string) (string, error) {
   logFileName := c.GlobalString("log-file")
   credentialsFileName := c.GlobalString("credentials")
@@ -294,6 +389,7 @@ func setup(c *cli.Context, style string) (string, error) {
 
   setupLogging(logFileName, style)
   setupS3Client(awsRegionName, credentialsFileName, awsRoleName)
+  setupProfiler()
 
   numCPUs := runtime.NumCPU()
   runtime.GOMAXPROCS(numCPUs)
@@ -302,10 +398,6 @@ func setup(c *cli.Context, style string) (string, error) {
 }
 
 func main() {
-  go func() {
-    log.Println(http.ListenAndServe("localhost:6060", nil))
-  }()
-
   app := cli.NewApp()
 
   app.Name = "s3-sse"
@@ -365,12 +457,17 @@ func main() {
       Usage:       "Report",
       Description: "Provide a report of the encryption status of each object",
       Action: func(c *cli.Context) error {
+        key := c.Args().Get(0)
         awsBucketName, err := setup(c, "report")
         if err != nil {
           return err
         }
 
-        reportOnBucket(awsBucketName)
+        if len(key) == 0 {
+          reportOnBucket(awsBucketName)
+        } else {
+          reportOnObjectInBucket(awsBucketName, key)
+        }
         return nil
       },
     },
@@ -379,12 +476,17 @@ func main() {
       Usage:       "Encrypt",
       Description: "Encrypt every object in the bucket",
       Action: func(c *cli.Context) error {
+        key := c.Args().Get(0)
         awsBucketName, err := setup(c, "encrypt")
         if err != nil {
           return err
         }
 
-        encryptBucket(awsBucketName)
+        if len(key) == 0 {
+          encryptObjectsInBucket(awsBucketName)
+        } else {
+          encryptObjectInBucket(awsBucketName, key)
+        }
         return nil
       },
     },

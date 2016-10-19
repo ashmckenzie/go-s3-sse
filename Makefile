@@ -16,6 +16,14 @@ releases: release_linux_amd64
 release_linux_amd64: bin_dir
 	CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o ${BINARY_RELEASE}_linux_amd64
 
+.PHONY: get_deps
+get_deps:
+	go get ./...
+
+.PHONY: update_deps
+update_deps:
+	go get -u ./...
+
 .PHONY: bin_dir
 bin_dir:
 	mkdir -p bin
