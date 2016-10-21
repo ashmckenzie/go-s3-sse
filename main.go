@@ -27,8 +27,8 @@ import (
 // DEBUG ...
 var DEBUG = false
 
-// VERBOSE ...
-var VERBOSE = false
+// QUIET ...
+var QUIET = false
 
 var diskLoggerFile os.File
 
@@ -367,8 +367,8 @@ func setupLogging(logFileName string, extra string) {
   if DEBUG {
     Logger.Level = logrus.DebugLevel
     DiskLogger.Level = logrus.DebugLevel
-  } else if VERBOSE {
-    Logger.Level = logrus.InfoLevel
+  } else if QUIET {
+    Logger.Level = logrus.ErrorLevel
   }
 }
 
@@ -415,10 +415,10 @@ func main() {
 
   app.Flags = []cli.Flag{
     cli.BoolFlag{
-      Name:        "verbose",
-      Usage:       "Verbose mode",
-      EnvVar:      "VERBOSE",
-      Destination: &VERBOSE,
+      Name:        "quiet",
+      Usage:       "Quiet mode",
+      EnvVar:      "QUIET",
+      Destination: &QUIET,
     },
     cli.BoolFlag{
       Name:        "debug",
